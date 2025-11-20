@@ -1,5 +1,5 @@
 #!/bin/sh -l
-# FILENAME: mo_celo_v_b_phase2.slurm
+# FILENAME: base_galign.slurm
 #SBATCH --account=rajivak
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -9,7 +9,7 @@
 #SBATCH --partition=a100-80gb
 #SBATCH --gres=gpu:1
 #SBATCH --mem=100G
-#SBATCH --qos=standby
+#SBATCH --qos=normal
 
 set -euo pipefail
 
@@ -32,10 +32,13 @@ export WANDB_NAME="${RUN_GROUP}"
 export WANDB_RESUME="never"
 export WANDB_TAGS="grad_align"
 
-python -m celo.train 
+TRAIN_LOG_DIR="/scratch/gilbreth/${USER_NAME}/molo_grad_allign/${RUN_GROUP}"
+
+python -m celo.train \
     --optimizer celo_phase1 \
+    --train_log_dir="${TRAIN_LOG_DIR}/phase1" \
     --train_partial \
-    --outer_iterations 1 \
+    --outer_iterations 100000 \
     --max_unroll_length 2000 \
     --seed 0 \
     --trainer pes \
@@ -44,23 +47,5 @@ python -m celo.train
     --name train_celo_phase1 \
     --outer_lr 3e-4 \
     --task fast_velo \
-    --log_grad_alignment
-
-python -m celo.celo.train \
-    --optimizer=celo \
-    --train_partial \
-    --lstm_hidden_size=256 \
-    --mlp_hidden_size=32 \
-    --celo_param_inits=64 \
-    --init_from_ckpt="${TRAIN_LOG_DIR}/phase1/checkpoints/train_celo_phase1/theta.state" \
-    --outer_iterations=100000 \
-    --max_unroll_length=2000 \
-    --trainer=pes \
-    --seed=0 \
-    --name=train_celo_phase2 \
-    --task=fast_velo \
-    --outer_lr=3e-4 \
-    --aug=reparam \
-    --aug_reparam_level=global \
-    --train_log_dir="${TRAIN_LOG_DIR}/phase2" \
-    --ckpt_save_dir="${TRAIN_LOG_DIR}/phase2/checkpoints"
+    --log_grad_alignment \
+    --disable_wandb 
