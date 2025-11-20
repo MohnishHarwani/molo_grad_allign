@@ -47,6 +47,7 @@ flags.DEFINE_string("aug", None, "task augmentation")
 flags.DEFINE_bool("disable_wandb", False, "disable wandb logging e.g. for debugging")
 flags.DEFINE_string("wandb_project", None, "wandb project name")
 flags.DEFINE_string("wandb_entity", None, "wandb project entity, specify username for individuals")
+flags.DEFINE_bool("log_grad_alignment", False, "log pairwise gradient alignment statistics")
 # fmt: on
 
 flags.mark_flag_as_required("optimizer")

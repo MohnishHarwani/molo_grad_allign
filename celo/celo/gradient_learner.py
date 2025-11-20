@@ -518,13 +518,12 @@ def gradient_worker_compute(
         to_put = AggregatedGradient(
             theta_grads=grads_accum, theta_model_state=theta_model_state, mean_loss=mean_loss
         )
-
-        return WorkerComputeOut(
-            to_put=jax.tree_util.tree_map(onp.asarray, to_put),
-            unroll_states=unroll_states_out,
-            metrics=metrics,
-            event_info=event_info,
-        )
+    return WorkerComputeOut(
+        to_put=jax.tree_util.tree_map(onp.asarray, to_put),
+        unroll_states=unroll_states_out,
+        metrics=metrics,
+        event_info=event_info,
+    )
 
 
 @flax.struct.dataclass

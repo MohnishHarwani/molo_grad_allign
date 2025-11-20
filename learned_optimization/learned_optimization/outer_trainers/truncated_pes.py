@@ -16,8 +16,10 @@
 """A vetorized, truncated, PES based gradient estimator."""
 
 import functools
+import os
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
+from absl import logging
 import flax
 from flax import jax_utils as flax_jax_utils
 import gin
@@ -25,10 +27,12 @@ import haiku as hk
 import jax
 from jax import lax
 import jax.numpy as jnp
+import numpy as onp
 from learned_optimization import jax_utils
 from learned_optimization import profile
 from learned_optimization import summary
 from learned_optimization import tree_utils
+from learned_optimization.gradient_alignment import cosine_alignment
 from learned_optimization.outer_trainers import common
 from learned_optimization.outer_trainers import gradient_learner
 from learned_optimization.outer_trainers import truncated_step as truncated_step_mod
@@ -139,6 +143,103 @@ def compute_pes_grad(
   )  # pytype: disable=bad-return-type
 
 
+def _scale_tree_by_loss(loss_vec: jnp.ndarray, tree):
+  """Scale each leaf by the provided per-task loss vector."""
+
+  def _scale(leaf):
+    reshape_dims = (loss_vec.shape[0],) + (1,) * (leaf.ndim - 1)
+    return loss_vec.reshape(reshape_dims) * leaf
+
+  return jax.tree_util.tree_map(_scale, tree)
+
+
+def _chunk_gradients_for_alignment(p_yses, p_ys, delta_losses, accumulator,
+                                   vec_pos, std):
+  """Compute per-truncation gradients for alignment logging."""
+  if not p_yses:
+    return []
+
+  chunk_lengths = [tree_utils.first_dim(c.loss) for c in p_yses]
+  mask = p_ys.mask
+  denom = jnp.sum(mask, axis=0)
+  denom = jnp.where(denom == 0, 1.0, denom)
+  has_finished = lax.cumsum(jnp.asarray(p_ys.is_done, dtype=jnp.int32)) > 0
+  factor = 1.0 / (2 * std**2)
+  accumulator_plus_vec = tree_utils.tree_add(vec_pos, accumulator)
+
+  chunk_grads = []
+  start = 0
+  for length in chunk_lengths:
+    sl = slice(start, start + length)
+    chunk_mask = mask[sl]
+    chunk_delta = delta_losses[sl]
+    chunk_finished = has_finished[sl]
+    pre_loss = jnp.sum(
+        chunk_delta * (1.0 - chunk_finished) * chunk_mask, axis=0) / denom
+    post_loss = jnp.sum(
+        chunk_delta * chunk_finished * chunk_mask, axis=0) / denom
+
+    grad_from_acc = _scale_tree_by_loss(pre_loss, accumulator_plus_vec)
+    grad_from_new = _scale_tree_by_loss(post_loss, vec_pos)
+    chunk_per_task = jax.tree_util.tree_map(
+        lambda a, b: factor * (a + b), grad_from_acc, grad_from_new)
+    chunk_grad = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0),
+                                        chunk_per_task)
+    chunk_grads.append(chunk_grad)
+    start += length
+
+  return chunk_grads
+
+
+def _pairwise_alignment_values(chunk_grads):
+  if len(chunk_grads) < 2:
+    return None
+  vals = []
+  for i, grad_i in enumerate(chunk_grads):
+    for j in range(i + 1, len(chunk_grads)):
+      grad_j = chunk_grads[j]
+      vals.append(cosine_alignment(grad_i, grad_j))
+  if not vals:
+    return None
+  return jnp.asarray(vals)
+
+
+def _save_alignment_histogram(values: onp.ndarray, task_name: str,
+                              cfg_name: str, outer_iter: Optional[int]):
+  """Save histogram image for inspection in slurm directory."""
+  job_id = os.environ.get("SLURM_JOB_ID")
+  if job_id:
+    root = os.path.join(os.getcwd(), f"slurm-{job_id}")
+  else:
+    root = os.path.join(os.getcwd(), "slurm")
+  out_dir = os.path.join(root, "grad_align_images")
+  os.makedirs(out_dir, exist_ok=True)
+  suffix = f"_outer_{outer_iter:06d}" if outer_iter is not None else ""
+  safe_task = task_name.replace("/", "_")
+  filename = f"{safe_task}{suffix}.png"
+  path = os.path.join(out_dir, filename)
+
+  try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+  except ImportError:
+    logging.warning("matplotlib not available; skipping grad alignment figure for %s",
+                    task_name)
+    return
+
+  fig, ax = plt.subplots(figsize=(6, 4))
+  ax.hist(values, bins=20, range=(-1.0, 1.0), color="tab:blue", alpha=0.8)
+  ax.set_title(f"Grad Align {task_name} ({cfg_name})")
+  ax.set_xlabel("Cosine similarity")
+  ax.set_ylabel("Count")
+  ax.grid(True, linestyle="--", alpha=0.3)
+  fig.tight_layout()
+  fig.savefig(path)
+  plt.close(fig)
+
+
 @gin.configurable
 class TruncatedPES(gradient_learner.GradientEstimator):
   """GradientEstimator for computing PES gradient estimates.
@@ -168,6 +269,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
     self.steps_per_jit = steps_per_jit
     self.stack_antithetic_samples = stack_antithetic_samples
     self.sign_delta_loss_scalar = sign_delta_loss_scalar
+    self.log_grad_alignment = False
 
     if self.trunc_length % self.steps_per_jit != 0:
       raise ValueError("Pass a trunc_length and steps_per_jit that are"
@@ -201,6 +303,9 @@ class TruncatedPES(gradient_learner.GradientEstimator):
         for _ in range(self.trunc_length // self.steps_per_jit)
     ]
 
+  def enable_grad_alignment_logging(self, enabled: bool):
+    self.log_grad_alignment = enabled
+
   @profile.wrap()
   def compute_gradient_estimate(  # pytype: disable=signature-mismatch  # overriding-parameter-type-checks
       self,
@@ -216,6 +321,10 @@ class TruncatedPES(gradient_learner.GradientEstimator):
     rng = hk.PRNGSequence(key)
 
     theta = worker_weights.theta
+    outer_iter = None
+    if (worker_weights.outer_state is not None and
+        hasattr(worker_weights.outer_state, "outer_iteration")):
+      outer_iter = int(worker_weights.outer_state.outer_iteration)
 
     vec_pos, vec_p_theta, vec_n_theta = common.vector_sample_perturbations(
         theta, next(rng), self.std, self.truncated_step.num_tasks)
@@ -223,6 +332,7 @@ class TruncatedPES(gradient_learner.GradientEstimator):
     p_yses = []
     n_yses = []
     metrics = []
+    chunk_alignment_values = None
 
     # TODO(lmetz) consider switching this to be a jax.lax.scan when inside jit.
     for i in range(self.trunc_length // self.steps_per_jit):
@@ -268,6 +378,12 @@ class TruncatedPES(gradient_learner.GradientEstimator):
         self.std,
         sign_delta_loss_scalar=self.sign_delta_loss_scalar)
 
+    if self.log_grad_alignment:
+      chunk_grads = _chunk_gradients_for_alignment(p_yses, p_ys, delta_loss,
+                                                   accumulator, vec_pos,
+                                                   self.std)
+      chunk_alignment_values = _pairwise_alignment_values(chunk_grads)
+
     unroll_info = gradient_learner.UnrollInfo(
         loss=p_ys.loss,
         iteration=p_ys.iteration,
@@ -282,6 +398,19 @@ class TruncatedPES(gradient_learner.GradientEstimator):
 
     metrics = summary.aggregate_metric_list(
         metrics, use_jnp=jax_utils.in_jit(), key=next(rng))
+    if chunk_alignment_values is not None:
+      metrics[f"collect||grad_align/{self.task_name()}"] = chunk_alignment_values
+      metrics[f"collect||grad_align/{self.cfg_name()}"] = chunk_alignment_values
+      values_np = onp.asarray(chunk_alignment_values)
+      logging.info(
+          "GradAlignValues task=%s cfg=%s count=%d values=%s",
+          self.task_name(),
+          self.cfg_name(),
+          values_np.size,
+          values_np.tolist(),
+      )
+      _save_alignment_histogram(values_np, self.task_name(), self.cfg_name(),
+                                outer_iter)
     if with_summary:
       metrics["sample||delta_loss_sample"] = summary.sample_value(
           key, jnp.abs(delta_loss))

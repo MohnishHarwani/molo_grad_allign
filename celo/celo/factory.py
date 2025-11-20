@@ -24,12 +24,12 @@ def get_task_family(name):
     if name == "fast_velo":
         # fast meta-training tasks from velo
         task_list = [
-            tasks.cifar_task(8),
-            tasks.fashion_mnist_task(8),
-            tasks.mnist_task(8),
-            tasks.svhn_task(8),
+            ("cifar", tasks.cifar_task(8)),
+            ("fashion_mnist", tasks.fashion_mnist_task(8)),
+            ("mnist", tasks.mnist_task(8)),
+            ("svhn", tasks.svhn_task(8)),
         ]
-        return [single_task_to_family(task) for task in task_list]
+        return [single_task_to_family(task, name=label) for label, task in task_list]
     elif name == "fmnist":
         task_list = [image_mlp.ImageMLP_FashionMnist_Relu128x128()]
         return [single_task_to_family(task) for task in task_list]
@@ -214,7 +214,7 @@ flags.DEFINE_integer("trunc_length", 50, "truncation length in PES")
 
 def get_grad_estimator(name, task_family, lopt):
     if name == "pes":
-        return truncated_pes.TruncatedPES(
+        grad_est = truncated_pes.TruncatedPES(
             truncated_step=VectorizedLOptTruncatedStep(
                 task_family=task_family,
                 learned_opt=lopt,
@@ -228,6 +228,9 @@ def get_grad_estimator(name, task_family, lopt):
             trunc_length=FLAGS.trunc_length,
             steps_per_jit=FLAGS.steps_per_jit,
         )
+        if FLAGS.log_grad_alignment and hasattr(grad_est, "enable_grad_alignment_logging"):
+            grad_est.enable_grad_alignment_logging(True)
+        return grad_est
 
     elif name == "full_es":
         # modified from velo to match PES specs at small scale
